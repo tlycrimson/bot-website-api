@@ -25,3 +25,20 @@ def leaderboard():
         .limit(10) \
         .execute()
     return res.data
+
+@app.get("/hr")
+def get_hr():
+    res = supabase.table("HRs") \
+        .select("*") \
+        .order("user_id") \
+        .execute()
+    return res.data
+
+@app.get("/lr")
+def get_lr():
+    res = supabase.table("LRs") \
+        .select("*") \
+        .order("user_id") \
+        .execute()
+    return res.data
+
