@@ -4,8 +4,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
-from supabase import create_client, Client
 import os
+import json
 
 # Import authentication
 from auth import get_api_key
@@ -22,19 +22,134 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Supabase client using Render environment variables
+# Check for environment variables
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_ANON_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("Missing Supabase environment variables in Render")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+print(f"✅ Supabase URL: {SUPABASE_URL}")
+print(f"✅ Supabase Key present: {'Yes' if SUPABASE_KEY else 'No'}")
 
-# Test connection
-print(f"✅ Connected to Supabase at: {SUPABASE_URL}")
+# Import and initialize Supabase client
+try:
+    # Use supabase-py which is simpler and doesn't require Rust
+    from supabase_py import create_client
+    
+    # Initialize Supabase client
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    print("✅ Supabase client initialized successfully")
+    
+except ImportError:
+    # Fallback to requests-based implementation
+    print("⚠️  supabase-py not available, using fallback implementation")
+    import requests
+    
+    class SupabaseFallback:
+        def __init__(self, url, key):
+            self.url = url
+            self.headers = {
+                'apikey': key,
+                'Authorization': f'Bearer {key}',
+                'Content-Type': 'application/json'
+            }
+        
+        def table(self, table_name):
+            return SupabaseTable(self.url, table_name, self.headers)
+    
+    class SupabaseTable:
+        def __init__(self, base_url, table_name, headers):
+            self.base_url = f"{base_url}/rest/v1"
+            self.table_name = table_name
+            self.headers = headers
+        
+        def select(self, columns="*"):
+            self.columns = columns
+            return self
+        
+        def eq(self, column, value):
+            self.eq_filter = (column, value)
+            return self
+        
+        def order(self, column, desc=False):
+            self.order_by = f"{column}.{'desc' if desc else 'asc'}"
+            return self
+        
+        def limit(self, count):
+            self.limit_count = count
+            return self
+        
+        def execute(self):
+            url = f"{self.base_url}/{self.table_name}"
+            params = {
+                'select': self.columns if hasattr(self, 'columns') else '*'
+            }
+            
+            if hasattr(self, 'eq_filter'):
+                column, value = self.eq_filter
+                params[f'{column}'] = f'eq.{value}'
+            
+            if hasattr(self, 'order_by'):
+                params['order'] = self.order_by
+            
+            if hasattr(self, 'limit_count'):
+                params['limit'] = self.limit_count
+            
+            response = requests.get(url, headers=self.headers, params=params)
+            response.raise_for_status()
+            
+            class Result:
+                def __init__(self, data):
+                    self.data = data
+            
+            return Result(response.json())
+        
+        def insert(self, data):
+            url = f"{self.base_url}/{self.table_name}"
+            response = requests.post(url, headers=self.headers, json=data)
+            response.raise_for_status()
+            
+            class Result:
+                def __init__(self, data):
+                    self.data = data
+            
+            return Result(response.json())
+        
+        def update(self, data):
+            url = f"{self.base_url}/{self.table_name}"
+            if hasattr(self, 'eq_filter'):
+                column, value = self.eq_filter
+                url += f"?{column}=eq.{value}"
+            
+            response = requests.patch(url, headers=self.headers, json=data)
+            response.raise_for_status()
+            
+            class Result:
+                def __init__(self, data):
+                    self.data = data
+            
+            return Result(response.json())
+        
+        def delete(self):
+            url = f"{self.base_url}/{self.table_name}"
+            if hasattr(self, 'eq_filter'):
+                column, value = self.eq_filter
+                url += f"?{column}=eq.{value}"
+            
+            response = requests.delete(url, headers=self.headers)
+            response.raise_for_status()
+            
+            class Result:
+                def __init__(self):
+                    self.data = []
+            
+            return Result()
+    
+    supabase = SupabaseFallback(SUPABASE_URL, SUPABASE_KEY)
+    print("✅ Using fallback Supabase client")
 
-# Pydantic models
+# Pydantic models (same as before)
 class HRCreate(BaseModel):
     username: str
     discord_id: str
@@ -80,7 +195,17 @@ class BulkUpdateRequest(BaseModel):
     ids: List[str]
     updates: dict
 
-# ==================== PUBLIC ENDPOINTS (No auth needed) ====================
+# ==================== HELPER FUNCTIONS ====================
+
+def execute_safe(query):
+    """Execute Supabase query with error handling"""
+    try:
+        return query.execute()
+    except Exception as e:
+        print(f"Database error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+# ==================== PUBLIC ENDPOINTS ====================
 
 @app.get("/")
 def root():
@@ -129,21 +254,12 @@ def get_lr():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-# ==================== PROTECTED ENDPOINTS (Require API key) ====================
+# ==================== PROTECTED ENDPOINTS ====================
 
 @app.post("/hr")
 def create_hr(hr_data: HRCreate, api_key: str = Depends(get_api_key)):
     """Create a new HR member"""
     try:
-        # Check if HR member already exists
-        existing = supabase.table("HRs") \
-            .select("*") \
-            .or_(f"username.eq.{hr_data.username},discord_id.eq.{hr_data.discord_id}") \
-            .execute()
-        
-        if existing.data:
-            raise HTTPException(status_code=400, detail="HR member already exists")
-        
         # Prepare data
         hr_dict = hr_data.dict()
         hr_dict["created_at"] = datetime.utcnow().isoformat()
@@ -162,8 +278,6 @@ def create_hr(hr_data: HRCreate, api_key: str = Depends(get_api_key)):
             "message": "HR member created successfully",
             "data": res.data[0] if res.data else None
         }
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
@@ -171,37 +285,9 @@ def create_hr(hr_data: HRCreate, api_key: str = Depends(get_api_key)):
 def update_hr(hr_id: str, hr_data: HRUpdate, api_key: str = Depends(get_api_key)):
     """Update an existing HR member"""
     try:
-        # Check if HR member exists
-        existing = supabase.table("HRs") \
-            .select("*") \
-            .eq("id", hr_id) \
-            .execute()
-        
-        if not existing.data:
-            raise HTTPException(status_code=404, detail="HR member not found")
-        
         # Prepare update data
         update_data = hr_data.dict(exclude_unset=True)
         update_data["updated_at"] = datetime.utcnow().isoformat()
-        
-        # Check for duplicates if updating username or discord_id
-        if update_data.get("username") or update_data.get("discord_id"):
-            duplicate_check = supabase.table("HRs") \
-                .select("*") \
-                .neq("id", hr_id)
-            
-            conditions = []
-            if update_data.get("username"):
-                conditions.append(f"username.eq.{update_data['username']}")
-            if update_data.get("discord_id"):
-                conditions.append(f"discord_id.eq.{update_data['discord_id']}")
-            
-            if conditions:
-                duplicate_check = duplicate_check.or_(",".join(conditions))
-                duplicates = duplicate_check.execute()
-                
-                if duplicates.data:
-                    raise HTTPException(status_code=400, detail="Another HR member already exists with this username or Discord ID")
         
         # Update the record
         res = supabase.table("HRs") \
@@ -209,13 +295,14 @@ def update_hr(hr_id: str, hr_data: HRUpdate, api_key: str = Depends(get_api_key)
             .eq("id", hr_id) \
             .execute()
         
+        if not res.data:
+            raise HTTPException(status_code=404, detail="HR member not found")
+        
         return {
             "success": True,
             "message": "HR member updated successfully",
             "data": res.data[0] if res.data else None
         }
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
@@ -223,15 +310,6 @@ def update_hr(hr_id: str, hr_data: HRUpdate, api_key: str = Depends(get_api_key)
 def delete_hr(hr_id: str, api_key: str = Depends(get_api_key)):
     """Delete an HR member"""
     try:
-        # Check if HR member exists
-        existing = supabase.table("HRs") \
-            .select("*") \
-            .eq("id", hr_id) \
-            .execute()
-        
-        if not existing.data:
-            raise HTTPException(status_code=404, detail="HR member not found")
-        
         # Delete the record
         supabase.table("HRs") \
             .delete() \
@@ -245,21 +323,12 @@ def delete_hr(hr_id: str, api_key: str = Depends(get_api_key)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-# ==================== LR ENDPOINTS (Same pattern as HR) ====================
+# ==================== LR ENDPOINTS ====================
 
 @app.post("/lr")
 def create_lr(lr_data: LRCreate, api_key: str = Depends(get_api_key)):
     """Create a new LR member"""
     try:
-        # Check if LR member already exists
-        existing = supabase.table("LRs") \
-            .select("*") \
-            .or_(f"username.eq.{lr_data.username},discord_id.eq.{lr_data.discord_id}") \
-            .execute()
-        
-        if existing.data:
-            raise HTTPException(status_code=400, detail="LR member already exists")
-        
         # Prepare data
         lr_dict = lr_data.dict()
         lr_dict["created_at"] = datetime.utcnow().isoformat()
@@ -285,15 +354,6 @@ def create_lr(lr_data: LRCreate, api_key: str = Depends(get_api_key)):
 def update_lr(lr_id: str, lr_data: LRUpdate, api_key: str = Depends(get_api_key)):
     """Update an existing LR member"""
     try:
-        # Check if LR member exists
-        existing = supabase.table("LRs") \
-            .select("*") \
-            .eq("id", lr_id) \
-            .execute()
-        
-        if not existing.data:
-            raise HTTPException(status_code=404, detail="LR member not found")
-        
         # Prepare update data
         update_data = lr_data.dict(exclude_unset=True)
         update_data["updated_at"] = datetime.utcnow().isoformat()
@@ -303,6 +363,9 @@ def update_lr(lr_id: str, lr_data: LRUpdate, api_key: str = Depends(get_api_key)
             .update(update_data) \
             .eq("id", lr_id) \
             .execute()
+        
+        if not res.data:
+            raise HTTPException(status_code=404, detail="LR member not found")
         
         return {
             "success": True,
@@ -316,15 +379,6 @@ def update_lr(lr_id: str, lr_data: LRUpdate, api_key: str = Depends(get_api_key)
 def delete_lr(lr_id: str, api_key: str = Depends(get_api_key)):
     """Delete an LR member"""
     try:
-        # Check if LR member exists
-        existing = supabase.table("LRs") \
-            .select("*") \
-            .eq("id", lr_id) \
-            .execute()
-        
-        if not existing.data:
-            raise HTTPException(status_code=404, detail="LR member not found")
-        
         # Delete the record
         supabase.table("LRs") \
             .delete() \
@@ -356,15 +410,6 @@ def get_all_users():
 def update_user(user_id: str, user_data: UserUpdate, api_key: str = Depends(get_api_key)):
     """Update user XP and level"""
     try:
-        # Check if user exists
-        existing = supabase.table("users") \
-            .select("*") \
-            .eq("user_id", user_id) \
-            .execute()
-        
-        if not existing.data:
-            raise HTTPException(status_code=404, detail="User not found")
-        
         # Prepare update data
         update_data = user_data.dict(exclude_unset=True)
         update_data["updated_at"] = datetime.utcnow().isoformat()
@@ -374,6 +419,9 @@ def update_user(user_id: str, user_data: UserUpdate, api_key: str = Depends(get_
             .update(update_data) \
             .eq("user_id", user_id) \
             .execute()
+        
+        if not res.data:
+            raise HTTPException(status_code=404, detail="User not found")
         
         return {
             "success": True,
@@ -387,15 +435,6 @@ def update_user(user_id: str, user_data: UserUpdate, api_key: str = Depends(get_
 def delete_user(user_id: str, api_key: str = Depends(get_api_key)):
     """Delete a user"""
     try:
-        # Check if user exists
-        existing = supabase.table("users") \
-            .select("*") \
-            .eq("user_id", user_id) \
-            .execute()
-        
-        if not existing.data:
-            raise HTTPException(status_code=404, detail="User not found")
-        
         # Delete the record
         supabase.table("users") \
             .delete() \
@@ -415,15 +454,15 @@ def delete_user(user_id: str, api_key: str = Depends(get_api_key)):
 def get_stats():
     """Get overall statistics"""
     try:
-        # Get counts (simplified version)
-        hr_data = supabase.table("HRs").select("*").execute()
-        lr_data = supabase.table("LRs").select("*").execute()
-        user_data = supabase.table("users").select("*").execute()
+        # Get counts
+        hr_res = supabase.table("HRs").select("*").execute()
+        lr_res = supabase.table("LRs").select("*").execute()
+        user_res = supabase.table("users").select("*").execute()
         
         return {
-            "hr_count": len(hr_data.data) if hr_data.data else 0,
-            "lr_count": len(lr_data.data) if lr_data.data else 0,
-            "user_count": len(user_data.data) if user_data.data else 0,
+            "hr_count": len(hr_res.data) if hr_res.data else 0,
+            "lr_count": len(lr_res.data) if lr_res.data else 0,
+            "user_count": len(user_res.data) if user_res.data else 0,
             "timestamp": datetime.utcnow().isoformat()
         }
     except Exception as e:
