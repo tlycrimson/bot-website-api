@@ -82,66 +82,125 @@ def get_lr():
 
 # ============ CREATE ENDPOINTS (New) ============
 
+# Allowed columns per table (to avoid sending invalid columns to Supabase)
+HR_COLUMNS = {
+    "user_id",
+    "username",
+    "tryouts",
+    "events",
+    "phases",
+    "courses",
+    "inspections",
+    "joint_events",
+}
+
+LR_COLUMNS = {
+    "user_id",
+    "username",
+    "activity",
+    "time_guarded",
+    "events_attended",
+}
+
+USER_COLUMNS = {
+    "user_id",
+    "username",
+    "xp",
+}
+
+
+def _filter_payload(data: dict, allowed_keys: set[str]) -> dict:
+    """Return a copy of data containing only keys that exist in the table.
+
+    This prevents 400s from Supabase when the payload contains unknown columns.
+    """
+    return {k: v for k, v in data.items() if k in allowed_keys}
+
+
 @app.post("/hr")
 def create_hr(data: dict):
-    """Create a new HR member"""
-    required_fields = ["username", "discord_id", "division", "rank"]
-    for field in required_fields:
-        if field not in data:
-            raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
-    
-    return supabase_request("POST", "HRs", data=data)
+    """Create a new HR row.
+
+    Only "username" is required; "user_id" and stat columns are optional
+    and can be filled in later or defaulted in the database.
+    """
+    if "username" not in data:
+        raise HTTPException(status_code=400, detail="Missing required field: username")
+
+    payload = _filter_payload(data, HR_COLUMNS)
+    return supabase_request("POST", "HRs", data=payload)
+
 
 @app.post("/lr")
 def create_lr(data: dict):
-    """Create a new LR member"""
-    required_fields = ["username", "discord_id", "division", "rank"]
-    for field in required_fields:
-        if field not in data:
-            raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
-    
-    return supabase_request("POST", "LRs", data=data)
+    """Create a new LR row.
+
+    Only "username" is required; "user_id" and stat columns are optional.
+    """
+    if "username" not in data:
+        raise HTTPException(status_code=400, detail="Missing required field: username")
+
+    payload = _filter_payload(data, LR_COLUMNS)
+    return supabase_request("POST", "LRs", data=payload)
+
 
 @app.post("/users")
 def create_user(data: dict):
-    """Create a new user"""
-    required_fields = ["user_id", "username"]
-    for field in required_fields:
-        if field not in data:
-            raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
-    
-    return supabase_request("POST", "users", data=data)
+    """Create a new user (XP entry).
+
+    Only "username" is required; "user_id" and "xp" are optional.
+    """
+    if "username" not in data:
+        raise HTTPException(status_code=400, detail="Missing required field: username")
+
+    payload = _filter_payload(data, USER_COLUMNS)
+    return supabase_request("POST", "users", data=payload)
+
 
 # ============ UPDATE ENDPOINTS (New) ============
 
 @app.put("/hr/{hr_id}")
 def update_hr(hr_id: str, data: dict):
-    """Update an HR member"""
-    return supabase_request("PATCH", "HRs", data=data, record_id=hr_id)
+    """Update an HR row (any of the stat columns or username)."""
+    payload = _filter_payload(data, HR_COLUMNS)
+    if not payload:
+        raise HTTPException(status_code=400, detail="No valid fields to update for HR")
+    return supabase_request("PATCH", "HRs", data=payload, record_id=hr_id)
+
 
 @app.put("/lr/{lr_id}")
 def update_lr(lr_id: str, data: dict):
-    """Update an LR member"""
-    return supabase_request("PATCH", "LRs", data=data, record_id=lr_id)
+    """Update an LR row (any of the stat columns or username)."""
+    payload = _filter_payload(data, LR_COLUMNS)
+    if not payload:
+        raise HTTPException(status_code=400, detail="No valid fields to update for LR")
+    return supabase_request("PATCH", "LRs", data=payload, record_id=lr_id)
+
 
 @app.put("/users/{user_id}")
 def update_user(user_id: str, data: dict):
-    """Update a user's XP/level"""
-    return supabase_request("PATCH", "users", data=data, record_id=user_id)
+    """Update a user's XP or username."""
+    payload = _filter_payload(data, USER_COLUMNS)
+    if not payload:
+        raise HTTPException(status_code=400, detail="No valid fields to update for user")
+    return supabase_request("PATCH", "users", data=payload, record_id=user_id)
+
 
 # ============ DELETE ENDPOINTS (New) ============
 
 @app.delete("/hr/{hr_id}")
 def delete_hr(hr_id: str):
-    """Delete an HR member"""
+    """Delete an HR row"""
     return supabase_request("DELETE", "HRs", record_id=hr_id)
+
 
 @app.delete("/lr/{lr_id}")
 def delete_lr(lr_id: str):
-    """Delete an LR member"""
+    """Delete an LR row"""
     return supabase_request("DELETE", "LRs", record_id=lr_id)
+
 
 @app.delete("/users/{user_id}")
 def delete_user(user_id: str):
-    """Delete a user"""
+    """Delete a user row"""
     return supabase_request("DELETE", "users", record_id=user_id)
