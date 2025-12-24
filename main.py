@@ -3,7 +3,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import requests
-from typing import Optional
+from typing import Optional, List
 
 app = FastAPI()
 
@@ -33,8 +33,9 @@ HEADERS = {
 def supabase_request(method, table, data=None, params=None, record_id=None):
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     
-    if record_id:
-        url = f"{url}?id=eq.{record_id}"
+    # record_id always refers to the user_id column in our tables
+    if record_id is not None:
+        url = f"{url}?user_id=eq.{record_id}"
     
     response = requests.request(
         method=method,
@@ -59,14 +60,14 @@ def supabase_request(method, table, data=None, params=None, record_id=None):
 def root():
     return {"message": "Bot API is running"}
 
-# ============ GET ENDPOINTS (Existing - keep these) ============
+# ============ GET ENDPOINTS (Existing) ============
 
 @app.get("/leaderboard")
 def leaderboard():
+    """Get all users for admin panel (not just top 10)"""
     params = {
         "select": "user_id,username,xp",
-        "order": "xp.desc",
-        "limit": "10"
+        "order": "xp.desc"
     }
     return supabase_request("GET", "users", params=params)
 
@@ -80,9 +81,26 @@ def get_lr():
     params = {"order": "user_id"}
     return supabase_request("GET", "LRs", params=params)
 
-# ============ CREATE ENDPOINTS (New) ============
+# ============ NEW: Get single user endpoints ============
 
-# Allowed columns per table (to avoid sending invalid columns to Supabase)
+@app.get("/hr/{user_id}")
+def get_hr_user(user_id: str):
+    """Get a single HR user"""
+    return supabase_request("GET", "HRs", record_id=user_id)
+
+@app.get("/lr/{user_id}")
+def get_lr_user(user_id: str):
+    """Get a single LR user"""
+    return supabase_request("GET", "LRs", record_id=user_id)
+
+@app.get("/users/{user_id}")
+def get_user(user_id: str):
+    """Get a single user"""
+    return supabase_request("GET", "users", record_id=user_id)
+
+# ============ CREATE ENDPOINTS ============
+
+# Allowed columns per table
 HR_COLUMNS = {
     "user_id",
     "username",
@@ -112,76 +130,56 @@ USER_COLUMNS = {
     "xp",
 }
 
-
 def _filter_payload(data: dict, allowed_keys: set[str]) -> dict:
-    """Return a copy of data containing only keys that exist in the table.
-
-    This prevents 400s from Supabase when the payload contains unknown columns.
-    """
+    """Return a copy of data containing only keys that exist in the table."""
     return {k: v for k, v in data.items() if k in allowed_keys}
-
 
 @app.post("/hr")
 def create_hr(data: dict):
-    """Create a new HR row.
-
-    Requires "user_id" (e.g. Roblox ID) and "username". Other columns are optional
-    and can be filled in later or defaulted in the database.
-    """
+    """Create a new HR row."""
     if "username" not in data or "user_id" not in data:
         raise HTTPException(status_code=400, detail="Missing required field: user_id or username")
 
     payload = _filter_payload(data, HR_COLUMNS)
     return supabase_request("POST", "HRs", data=payload)
 
-
 @app.post("/lr")
 def create_lr(data: dict):
-    """Create a new LR row.
-
-    Requires "user_id" and "username". Other columns are optional.
-    """
+    """Create a new LR row."""
     if "username" not in data or "user_id" not in data:
         raise HTTPException(status_code=400, detail="Missing required field: user_id or username")
 
     payload = _filter_payload(data, LR_COLUMNS)
     return supabase_request("POST", "LRs", data=payload)
 
-
 @app.post("/users")
 def create_user(data: dict):
-    """Create a new user (XP entry).
-
-    Requires "user_id" and "username". "xp" is optional.
-    """
+    """Create a new user (XP entry)."""
     if "username" not in data or "user_id" not in data:
         raise HTTPException(status_code=400, detail="Missing required field: user_id or username")
 
     payload = _filter_payload(data, USER_COLUMNS)
     return supabase_request("POST", "users", data=payload)
 
+# ============ UPDATE ENDPOINTS ============
 
-# ============ UPDATE ENDPOINTS (New) ============
-
-@app.put("/hr/{hr_id}")
-def update_hr(hr_id: str, data: dict):
-    """Update an HR row (any of the stat columns or username)."""
+@app.patch("/hr/{user_id}")
+def update_hr(user_id: str, data: dict):
+    """Update an HR row."""
     payload = _filter_payload(data, HR_COLUMNS)
     if not payload:
         raise HTTPException(status_code=400, detail="No valid fields to update for HR")
-    return supabase_request("PATCH", "HRs", data=payload, record_id=hr_id)
+    return supabase_request("PATCH", "HRs", data=payload, record_id=user_id)
 
-
-@app.put("/lr/{lr_id}")
-def update_lr(lr_id: str, data: dict):
-    """Update an LR row (any of the stat columns or username)."""
+@app.patch("/lr/{user_id}")
+def update_lr(user_id: str, data: dict):
+    """Update an LR row."""
     payload = _filter_payload(data, LR_COLUMNS)
     if not payload:
         raise HTTPException(status_code=400, detail="No valid fields to update for LR")
-    return supabase_request("PATCH", "LRs", data=payload, record_id=lr_id)
+    return supabase_request("PATCH", "LRs", data=payload, record_id=user_id)
 
-
-@app.put("/users/{user_id}")
+@app.patch("/users/{user_id}")
 def update_user(user_id: str, data: dict):
     """Update a user's XP or username."""
     payload = _filter_payload(data, USER_COLUMNS)
@@ -189,22 +187,34 @@ def update_user(user_id: str, data: dict):
         raise HTTPException(status_code=400, detail="No valid fields to update for user")
     return supabase_request("PATCH", "users", data=payload, record_id=user_id)
 
+# ============ DELETE ENDPOINTS ============
 
-# ============ DELETE ENDPOINTS (New) ============
-
-@app.delete("/hr/{hr_id}")
-def delete_hr(hr_id: str):
+@app.delete("/hr/{user_id}")
+def delete_hr(user_id: str):
     """Delete an HR row"""
-    return supabase_request("DELETE", "HRs", record_id=hr_id)
+    return supabase_request("DELETE", "HRs", record_id=user_id)
 
-
-@app.delete("/lr/{lr_id}")
-def delete_lr(lr_id: str):
+@app.delete("/lr/{user_id}")
+def delete_lr(user_id: str):
     """Delete an LR row"""
-    return supabase_request("DELETE", "LRs", record_id=lr_id)
-
+    return supabase_request("DELETE", "LRs", record_id=user_id)
 
 @app.delete("/users/{user_id}")
 def delete_user(user_id: str):
     """Delete a user row"""
     return supabase_request("DELETE", "users", record_id=user_id)
+
+# ============ HEALTH CHECK ============
+
+@app.get("/health")
+def health_check():
+    """Health check endpoint"""
+    try:
+        # Test Supabase connection
+        response = requests.get(f"{SUPABASE_URL}/rest/v1/", headers=HEADERS)
+        if response.status_code == 200:
+            return {"status": "healthy", "supabase": "connected"}
+        else:
+            return {"status": "unhealthy", "supabase": f"error: {response.status_code}"}
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}
