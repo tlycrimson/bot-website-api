@@ -26,7 +26,8 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
+    "Prefer": "return=representation"  # This ensures PATCH returns the updated record
 }
 
 # Helper function to make Supabase requests
@@ -51,20 +52,35 @@ def supabase_request(method, table, data=None, params=None, record_id=None):
             detail=f"Supabase error: {response.text}"
         )
     
-    if method == "DELETE":
-        return {"success": True}
+    # For PATCH/DELETE operations that might return empty response
+    if response.status_code == 204 or response.text == "":
+        if method == "DELETE":
+            return {"success": True, "message": "Record deleted successfully"}
+        elif method == "PATCH":
+            return {"success": True, "message": "Record updated successfully"}
+        else:
+            return {"success": True}
     
-    return response.json()
+    try:
+        return response.json()
+    except:
+        # If we can't parse JSON, return success message
+        if method == "DELETE":
+            return {"success": True, "message": "Record deleted successfully"}
+        elif method == "PATCH":
+            return {"success": True, "message": "Record updated successfully"}
+        else:
+            return {"success": True, "message": "Operation completed"}
 
 @app.get("/")
 def root():
     return {"message": "Bot API is running"}
 
-# ============ GET ENDPOINTS (Existing) ============
+# ============ GET ENDPOINTS ============
 
 @app.get("/leaderboard")
 def leaderboard():
-    """Get all users for admin panel (not just top 10)"""
+    """Get all XP users for admin panel"""
     params = {
         "select": "user_id,username,xp",
         "order": "xp.desc"
@@ -73,30 +89,15 @@ def leaderboard():
 
 @app.get("/hr")
 def get_hr():
+    """Get all HR users"""
     params = {"order": "user_id"}
     return supabase_request("GET", "HRs", params=params)
 
 @app.get("/lr")
 def get_lr():
+    """Get all LR users"""
     params = {"order": "user_id"}
     return supabase_request("GET", "LRs", params=params)
-
-# ============ NEW: Get single user endpoints ============
-
-@app.get("/hr/{user_id}")
-def get_hr_user(user_id: str):
-    """Get a single HR user"""
-    return supabase_request("GET", "HRs", record_id=user_id)
-
-@app.get("/lr/{user_id}")
-def get_lr_user(user_id: str):
-    """Get a single LR user"""
-    return supabase_request("GET", "LRs", record_id=user_id)
-
-@app.get("/users/{user_id}")
-def get_user(user_id: str):
-    """Get a single user"""
-    return supabase_request("GET", "users", record_id=user_id)
 
 # ============ CREATE ENDPOINTS ============
 
