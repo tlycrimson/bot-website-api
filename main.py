@@ -62,7 +62,7 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# ============ HELPER FUNCTIONS (Keep your existing ones) ============
+# ============ HELPER FUNCTIONS ============
 
 def supabase_request(method, table, data=None, params=None, record_id=None):
     """Your existing supabase_request function"""
@@ -283,15 +283,63 @@ async def check_permissions(user: dict = Depends(is_admin_or_hicom)):
         "is_admin": user.get("discord_id") == ADMIN_DISCORD_ID
     }
 
-# ============ EXISTING ENDPOINTS (Protected) ============
+# ============ PUBLIC LEADERBOARD ENDPOINTS ============
 
 @app.get("/")
 def root():
     return {"message": "Bot API is running"}
 
+# PUBLIC endpoint - no authentication required
+@app.get("/public/leaderboard")
+async def public_leaderboard():
+    """Public XP leaderboard - no authentication required"""
+    params = {
+        "select": "user_id,username,xp",
+        "order": "xp.desc",
+        "limit": "100"  # Limit results for performance
+    }
+    try:
+        return supabase_request("GET", "users", params=params)
+    except Exception as e:
+        logger.error(f"Failed to fetch public leaderboard: {e}")
+        return []
+
+# PUBLIC endpoint - no authentication required
+@app.get("/public/hr")
+async def public_hr():
+    """Public HR leaderboard - no authentication required"""
+    params = {
+        "select": "user_id,username,tryouts,events,phases,courses,inspections,joint_events,division,rank",
+        "order": "user_id",
+        "limit": "100"
+    }
+    try:
+        return supabase_request("GET", "HRs", params=params)
+    except Exception as e:
+        logger.error(f"Failed to fetch public HR data: {e}")
+        return []
+
+# PUBLIC endpoint - no authentication required
+@app.get("/public/lr")
+async def public_lr():
+    """Public LR leaderboard - no authentication required"""
+    params = {
+        "select": "user_id,username,activity,time_guarded,events_attended,division,rank",
+        "order": "user_id",
+        "limit": "100"
+    }
+    try:
+        return supabase_request("GET", "LRs", params=params)
+    except Exception as e:
+        logger.error(f"Failed to fetch public LR data: {e}")
+        return []
+
+# ============ ADMIN ENDPOINTS (Protected) ============
+
+# Keep existing protected endpoints for admin panel
 @app.get("/leaderboard")
 async def leaderboard(user: dict = Depends(is_admin_or_hicom)):
-    """Get all users for admin panel"""
+    """Get all users for admin panel (protected)"""
     params = {
         "select": "user_id,username,xp",
         "order": "xp.desc"
