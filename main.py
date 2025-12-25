@@ -564,11 +564,11 @@ HIERARCHY_HEADER_COLUMNS = {
 async def get_hierarchy():
     """Get all hierarchy data for display"""
     try:
-        # Get all active sections
+        # Get all active sections - ADD is_active to select
         sections_params = {
-            "select": "id,section_title,section_type,accent_color,display_order",
+            "select": "id,section_title,section_type,accent_color,display_order,is_active",  # ADDED is_active
             "order": "display_order",
-            "is_active": "eq.true"
+            "is_active": "eq.true"  # This filters only active sections
         }
         sections = supabase_request("GET", "hierarchy_sections", params=sections_params)
         
