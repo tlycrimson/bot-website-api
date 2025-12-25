@@ -1,12 +1,16 @@
-# main.py - Add these imports
+# main.py
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import os
 import requests
-import jwt
 import time
+import logging
 from typing import Optional, List
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -18,8 +22,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-import os
 
 # Get all environment variables
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -60,23 +62,87 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
+# ============ HELPER FUNCTIONS (Keep your existing ones) ============
+
+def supabase_request(method, table, data=None, params=None, record_id=None):
+    """Your existing supabase_request function"""
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    
+    if record_id is not None:
+        url = f"{url}?user_id=eq.{record_id}"
+    
+    response = requests.request(
+        method=method,
+        url=url,
+        headers=HEADERS,
+        json=data,
+        params=params
+    )
+    
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"Supabase error: {response.text}"
+        )
+    
+    if method == "DELETE":
+        return {"success": True}
+    
+    return response.json()
+
+def _filter_payload(data: dict, allowed_keys: set[str]) -> dict:
+    """Your existing _filter_payload function"""
+    return {k: v for k, v in data.items() if k in allowed_keys}
+
 # ============ AUTHENTICATION HELPERS ============
 
-def create_jwt_token(user_data: dict) -> str:
-    """Create a JWT token for authenticated user"""
-    payload = {
-        **user_data,
-        "exp": time.time() + 3600,  # 1 hour expiration
-        "iat": time.time()
-    }
-    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
-
-def verify_jwt_token(token: str) -> Optional[dict]:
-    """Verify and decode JWT token"""
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        return payload
-    except:
+# Try to import JWT, but provide a fallback if not installed
+try:
+    import jwt
+    
+    def create_jwt_token(user_data: dict) -> str:
+        """Create a JWT token for authenticated user"""
+        payload = {
+            **user_data,
+            "exp": time.time() + 3600,  # 1 hour expiration
+            "iat": time.time()
+        }
+        return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+    
+    def verify_jwt_token(token: str) -> Optional[dict]:
+        """Verify and decode JWT token"""
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+            return payload
+        except:
+            return None
+            
+except ImportError:
+    logger.warning("PyJWT not installed. Using simple token system (NOT SECURE FOR PRODUCTION)")
+    
+    # Simple fallback for development
+    import base64
+    import json
+    
+    def create_jwt_token(user_data: dict) -> str:
+        """Simple token creation (not secure)"""
+        payload = {
+            **user_data,
+            "exp": time.time() + 3600,
+            "iat": time.time()
+        }
+        json_str = json.dumps(payload)
+        return base64.b64encode(json_str.encode()).decode()
+    
+    def verify_jwt_token(token: str) -> Optional[dict]:
+        """Simple token verification (not secure)"""
+        try:
+            json_str = base64.b64decode(token.encode()).decode()
+            payload = json.loads(json_str)
+            if payload.get("exp", 0) > time.time():
+                return payload
+        except:
+            pass
         return None
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -95,7 +161,7 @@ async def is_admin_or_hicom(user: dict = Depends(get_current_user)):
     
     # Check HICOM role via Discord API
     headers = {
-        "Authorization": f"Bearer {DISCORD_BOT_TOKEN}"
+        "Authorization": f"Bot {DISCORD_BOT_TOKEN}"  # Fixed: Use "Bot" prefix
     }
     
     # Get user's roles in the guild
@@ -110,12 +176,10 @@ async def is_admin_or_hicom(user: dict = Depends(get_current_user)):
             roles = member_data.get("roles", [])
             
             # Check if user has HICOM role
-            # You'll need to replace "HICOM_ROLE_ID" with your actual HICOM role ID
-            HICOM_ROLE_ID = os.getenv("HICOM_ROLE_ID")
             if HICOM_ROLE_ID and HICOM_ROLE_ID in roles:
                 return user
-    except:
-        pass
+    except Exception as e:
+        logger.error(f"Failed to check Discord roles: {e}")
     
     raise HTTPException(status_code=403, detail="Access denied. Requires HICOM role or admin privileges.")
 
@@ -127,7 +191,7 @@ def discord_login():
     discord_auth_url = (
         f"https://discord.com/api/oauth2/authorize"
         f"?client_id={DISCORD_CLIENT_ID}"
-        f"&redirect_uri={os.getenv('DISCORD_REDIRECT_URI', 'http://localhost:5173/auth/callback')}"
+        f"&redirect_uri={DISCORD_REDIRECT_URI}"
         f"&response_type=code"
         f"&scope=identify+guilds.members.read"
     )
@@ -142,7 +206,7 @@ def discord_callback(code: str):
         "client_secret": DISCORD_CLIENT_SECRET,
         "grant_type": "authorization_code",
         "code": code,
-        "redirect_uri": os.getenv("DISCORD_REDIRECT_URI", "http://localhost:5173/auth/callback"),
+        "redirect_uri": DISCORD_REDIRECT_URI,
         "scope": "identify+guilds.members.read"
     }
     
@@ -157,6 +221,7 @@ def discord_callback(code: str):
     )
     
     if response.status_code != 200:
+        logger.error(f"Discord token exchange failed: {response.text}")
         raise HTTPException(status_code=400, detail="Failed to exchange code for token")
     
     tokens = response.json()
@@ -169,6 +234,7 @@ def discord_callback(code: str):
     )
     
     if user_response.status_code != 200:
+        logger.error(f"Discord user info failed: {user_response.text}")
         raise HTTPException(status_code=400, detail="Failed to get user info")
     
     user_data = user_response.json()
@@ -217,22 +283,136 @@ async def check_permissions(user: dict = Depends(is_admin_or_hicom)):
         "is_admin": user.get("discord_id") == ADMIN_DISCORD_ID
     }
 
-# ============ PROTECTED ENDPOINTS ============
+# ============ EXISTING ENDPOINTS (Protected) ============
 
-# Update ALL your existing endpoints to use the dependency
-# Example for /hr endpoint:
+@app.get("/")
+def root():
+    return {"message": "Bot API is running"}
+
+@app.get("/leaderboard")
+async def leaderboard(user: dict = Depends(is_admin_or_hicom)):
+    """Get all users for admin panel"""
+    params = {
+        "select": "user_id,username,xp",
+        "order": "xp.desc"
+    }
+    return supabase_request("GET", "users", params=params)
+
 @app.get("/hr")
-def get_hr(user: dict = Depends(is_admin_or_hicom)):
+async def get_hr(user: dict = Depends(is_admin_or_hicom)):
     """Get all HR users (protected)"""
     params = {"order": "user_id"}
     return supabase_request("GET", "HRs", params=params)
 
-# Do the same for ALL other endpoints:
-# - /lr
-# - /leaderboard
-# - POST/PATCH/DELETE endpoints
+@app.get("/lr")
+async def get_lr(user: dict = Depends(is_admin_or_hicom)):
+    """Get all LR users (protected)"""
+    params = {"order": "user_id"}
+    return supabase_request("GET", "LRs", params=params)
 
-# Keep the helper functions from before (supabase_request, etc.)
+# ============ CREATE ENDPOINTS (Protected) ============
+
+# Allowed columns per table
+HR_COLUMNS = {
+    "user_id",
+    "username",
+    "tryouts",
+    "events",
+    "phases",
+    "courses",
+    "inspections",
+    "joint_events",
+    "division",
+    "rank",
+}
+
+LR_COLUMNS = {
+    "user_id",
+    "username",
+    "activity",
+    "time_guarded",
+    "events_attended",
+    "division",
+    "rank",
+}
+
+USER_COLUMNS = {
+    "user_id",
+    "username",
+    "xp",
+}
+
+@app.post("/hr")
+async def create_hr(data: dict, user: dict = Depends(is_admin_or_hicom)):
+    """Create a new HR row."""
+    if "username" not in data or "user_id" not in data:
+        raise HTTPException(status_code=400, detail="Missing required field: user_id or username")
+
+    payload = _filter_payload(data, HR_COLUMNS)
+    return supabase_request("POST", "HRs", data=payload)
+
+@app.post("/lr")
+async def create_lr(data: dict, user: dict = Depends(is_admin_or_hicom)):
+    """Create a new LR row."""
+    if "username" not in data or "user_id" not in data:
+        raise HTTPException(status_code=400, detail="Missing required field: user_id or username")
+
+    payload = _filter_payload(data, LR_COLUMNS)
+    return supabase_request("POST", "LRs", data=payload)
+
+@app.post("/users")
+async def create_user(data: dict, user: dict = Depends(is_admin_or_hicom)):
+    """Create a new user (XP entry)."""
+    if "username" not in data or "user_id" not in data:
+        raise HTTPException(status_code=400, detail="Missing required field: user_id or username")
+
+    payload = _filter_payload(data, USER_COLUMNS)
+    return supabase_request("POST", "users", data=payload)
+
+# ============ UPDATE ENDPOINTS (Protected) ============
+
+@app.patch("/hr/{user_id}")
+async def update_hr(user_id: str, data: dict, user: dict = Depends(is_admin_or_hicom)):
+    """Update an HR row."""
+    payload = _filter_payload(data, HR_COLUMNS)
+    if not payload:
+        raise HTTPException(status_code=400, detail="No valid fields to update for HR")
+    return supabase_request("PATCH", "HRs", data=payload, record_id=user_id)
+
+@app.patch("/lr/{user_id}")
+async def update_lr(user_id: str, data: dict, user: dict = Depends(is_admin_or_hicom)):
+    """Update an LR row."""
+    payload = _filter_payload(data, LR_COLUMNS)
+    if not payload:
+        raise HTTPException(status_code=400, detail="No valid fields to update for LR")
+    return supabase_request("PATCH", "LRs", data=payload, record_id=user_id)
+
+@app.patch("/users/{user_id}")
+async def update_user(user_id: str, data: dict, user: dict = Depends(is_admin_or_hicom)):
+    """Update a user's XP or username."""
+    payload = _filter_payload(data, USER_COLUMNS)
+    if not payload:
+        raise HTTPException(status_code=400, detail="No valid fields to update for user")
+    return supabase_request("PATCH", "users", data=payload, record_id=user_id)
+
+# ============ DELETE ENDPOINTS (Protected) ============
+
+@app.delete("/hr/{user_id}")
+async def delete_hr(user_id: str, user: dict = Depends(is_admin_or_hicom)):
+    """Delete an HR row"""
+    return supabase_request("DELETE", "HRs", record_id=user_id)
+
+@app.delete("/lr/{user_id}")
+async def delete_lr(user_id: str, user: dict = Depends(is_admin_or_hicom)):
+    """Delete an LR row"""
+    return supabase_request("DELETE", "LRs", record_id=user_id)
+
+@app.delete("/users/{user_id}")
+async def delete_user(user_id: str, user: dict = Depends(is_admin_or_hicom)):
+    """Delete a user row"""
+    return supabase_request("DELETE", "users", record_id=user_id)
+
+# ============ HEALTH CHECK (Public) ============
 
 @app.get("/health")
 def health_check():
