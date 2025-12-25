@@ -17,11 +17,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
-
-# Add CORS middleware
+# Add CORS middleware - allow list from env or default to all for dev
+_allowed_origins = [s.strip() for s in os.getenv("ALLOWED_FRONTEND_ORIGINS", "").split(",") if s.strip()]
+_allow_origins = _allowed_origins if _allowed_origins else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=_allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,9 +41,24 @@ SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
 ADMIN_DISCORD_ID = "353167234698444802"  # Your Discord ID
 
 # Optional whitelist of allowed frontend origins (comma-separated)
+# NOTE: ALLOWED_FRONTEND_ORIGINS is read above when configuring CORS
 ALLOWED_FRONTEND_ORIGINS = [s.strip() for s in os.getenv("ALLOWED_FRONTEND_ORIGINS", "").split(",") if s.strip()]
 # Default frontend fallback (optional)
 DEFAULT_FRONTEND = os.getenv("DEFAULT_FRONTEND") or (ALLOWED_FRONTEND_ORIGINS[0] if ALLOWED_FRONTEND_ORIGINS else None)
+
+# Redis config for OAuth state storage
+REDIS_URL = os.getenv("REDIS_URL")
+redis_client = None
+try:
+    if REDIS_URL:
+        import redis
+
+        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+        # simple ping to verify connection
+        redis_client.ping()
+        logger.info("Connected to Redis for OAuth state storage")
+except Exception as e:
+    logger.warning(f"Redis not available or misconfigured ({e}); falling back to in-memory state map")
 
 # Validate
 required_vars = {
@@ -161,6 +177,41 @@ def _clean_state_map(expire_seconds: int = 300):
     for k in remove:
         state_map.pop(k, None)
 
+
+def _set_oauth_state(state: str, origin: Optional[str], ttl: int = 300):
+    """Store state -> origin mapping in Redis if available, otherwise in-memory."""
+    if redis_client:
+        try:
+            key = f"oauth:state:{state}"
+            redis_client.setex(key, ttl, origin or "")
+            return
+        except Exception as e:
+            logger.warning(f"Failed to set state in Redis: {e}")
+
+    # Fallback
+    state_map[state] = {"next": origin, "created_at": time.time()}
+
+
+def _pop_oauth_state(state: str) -> Optional[dict]:
+    """Retrieve and remove stored state mapping."""
+    if redis_client:
+        try:
+            key = f"oauth:state:{state}"
+            val = redis_client.get(key)
+            if val is None:
+                return None
+            # delete key
+            try:
+                redis_client.delete(key)
+            except Exception:
+                pass
+            return {"next": val} if val != "" else {"next": None}
+        except Exception as e:
+            logger.warning(f"Failed to pop state from Redis: {e}")
+
+    # Fallback
+    return state_map.pop(state, None)
+
 # ============ AUTHENTICATION HELPERS ============
 
 # Try to import JWT, but provide a fallback if not installed
@@ -270,9 +321,9 @@ def discord_login(next: Optional[str] = None, request: Request = None):
     if origin and ALLOWED_FRONTEND_ORIGINS and origin not in ALLOWED_FRONTEND_ORIGINS:
         raise HTTPException(status_code=400, detail="invalid_next")
 
-    # Create a one-time state value and store mapping
+    # Create a one-time state value and store mapping (Redis or fallback)
     state = secrets.token_urlsafe(16)
-    state_map[state] = {"next": origin, "created_at": time.time()}
+    _set_oauth_state(state, origin)
 
     discord_auth_url = (
         f"https://discord.com/api/oauth2/authorize"
@@ -292,9 +343,9 @@ def discord_callback(code: str, state: Optional[str] = None, request: Request = 
         logger.info(f"Discord callback received. Code: {code[:20]}... state={state}")
 
         # Pop mapping for state (one-time use)
-        mapping = None
-        if state:
-            mapping = state_map.pop(state, None)
+            mapping = None
+            if state:
+                mapping = _pop_oauth_state(state)
         # Fallback frontend target
         frontend_target = (mapping.get("next") if mapping else None) or DEFAULT_FRONTEND
         if ALLOWED_FRONTEND_ORIGINS and frontend_target and frontend_target not in ALLOWED_FRONTEND_ORIGINS:
@@ -469,6 +520,22 @@ async def public_lr():
         return supabase_request("GET", "LRs", params=params)
     except Exception as e:
         logger.error(f"Failed to fetch public LR data: {e}")
+        return []
+
+
+# PUBLIC endpoint - no authentication required
+@app.get("/public/users")
+async def public_users():
+    """Public users endpoint - returns basic user records (no auth)."""
+    params = {
+        "select": "user_id,username,xp",
+        "order": "user_id",
+        "limit": "500"
+    }
+    try:
+        return supabase_request("GET", "users", params=params)
+    except Exception as e:
+        logger.error(f"Failed to fetch public users: {e}")
         return []
 
 # ============ ADMIN ENDPOINTS (Protected) ============
