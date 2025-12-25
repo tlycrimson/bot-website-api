@@ -3,11 +3,13 @@ from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import RedirectResponse
-from urllib.parse import urlparse  
+from urllib.parse import urlparse
 import os
 import requests
 import time
 import logging
+import secrets
+import json
 from typing import Optional, List
 
 # Set up logging
@@ -36,6 +38,11 @@ HICOM_ROLE_ID = os.getenv("HICOM_ROLE_ID")
 DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI", "https://bot-website-api.onrender.com/auth/callback")
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
 ADMIN_DISCORD_ID = "353167234698444802"  # Your Discord ID
+
+# Optional whitelist of allowed frontend origins (comma-separated)
+ALLOWED_FRONTEND_ORIGINS = [s.strip() for s in os.getenv("ALLOWED_FRONTEND_ORIGINS", "").split(",") if s.strip()]
+# Default frontend fallback (optional)
+DEFAULT_FRONTEND = os.getenv("DEFAULT_FRONTEND") or (ALLOWED_FRONTEND_ORIGINS[0] if ALLOWED_FRONTEND_ORIGINS else None)
 
 # Validate
 required_vars = {
@@ -143,6 +150,17 @@ def _filter_payload(data: dict, allowed_keys: set[str]) -> dict:
     """Your existing _filter_payload function"""
     return {k: v for k, v in data.items() if k in allowed_keys}
 
+# ============ OAUTH STATE MAP ============
+# In-memory map state -> { next: frontend_origin, created_at: timestamp }
+# For production scale, use a persistent store or cache (Redis).
+state_map: dict = {}
+
+def _clean_state_map(expire_seconds: int = 300):
+    now = time.time()
+    remove = [k for k, v in state_map.items() if now - v.get("created_at", 0) > expire_seconds]
+    for k in remove:
+        state_map.pop(k, None)
+
 # ============ AUTHENTICATION HELPERS ============
 
 # Try to import JWT, but provide a fallback if not installed
@@ -235,62 +253,97 @@ async def is_admin_or_hicom(user: dict = Depends(get_current_user)):
 # ============ DISCORD OAUTH ENDPOINTS ============
 
 @app.get("/auth/discord/login")
-def discord_login():
-    """Redirect to Discord OAuth2"""
+def discord_login(next: Optional[str] = None, request: Request = None):
+    """Return Discord OAuth2 URL. Accepts optional `next` frontend origin.
+
+    The `next` param is stored server-side in a short-lived `state` mapping and
+    the generated Discord auth URL will include that `state`. After the OAuth
+    exchange the callback will use the stored `next` to redirect the user back
+    to the originating frontend.
+    """
+    _clean_state_map()
+
+    # Prefer explicit `next` query param, then Origin header, then default
+    origin = (next or (request.headers.get("origin") if request else None) or DEFAULT_FRONTEND)
+
+    # Validate origin against whitelist if provided
+    if origin and ALLOWED_FRONTEND_ORIGINS and origin not in ALLOWED_FRONTEND_ORIGINS:
+        raise HTTPException(status_code=400, detail="invalid_next")
+
+    # Create a one-time state value and store mapping
+    state = secrets.token_urlsafe(16)
+    state_map[state] = {"next": origin, "created_at": time.time()}
+
     discord_auth_url = (
         f"https://discord.com/api/oauth2/authorize"
         f"?client_id={DISCORD_CLIENT_ID}"
         f"&redirect_uri={DISCORD_REDIRECT_URI}"
         f"&response_type=code"
         f"&scope=identify+guilds.members.read"
+        f"&state={state}"
     )
+
     return {"auth_url": discord_auth_url}
 
 @app.get("/auth/callback")
-def discord_callback(code: str):
-    """Handle Discord OAuth2 callback - redirect to frontend with token"""
+def discord_callback(code: str, state: Optional[str] = None, request: Request = None, format: Optional[str] = None):
+    """Handle Discord OAuth2 callback - exchange code, mint token, redirect to frontend."""
     try:
-        logger.info(f"Discord callback received. Code: {code[:20]}...")
-        
+        logger.info(f"Discord callback received. Code: {code[:20]}... state={state}")
+
+        # Pop mapping for state (one-time use)
+        mapping = None
+        if state:
+            mapping = state_map.pop(state, None)
+        # Fallback frontend target
+        frontend_target = (mapping.get("next") if mapping else None) or DEFAULT_FRONTEND
+        if ALLOWED_FRONTEND_ORIGINS and frontend_target and frontend_target not in ALLOWED_FRONTEND_ORIGINS:
+            logger.error(f"Frontend target not allowed: {frontend_target}")
+            raise HTTPException(status_code=400, detail="invalid_redirect_target")
+
+        logger.info(f"Exchanging code, will redirect to: {frontend_target}")
+
         # Exchange code for access token
         token_data = {
             "client_id": DISCORD_CLIENT_ID,
             "client_secret": DISCORD_CLIENT_SECRET,
             "grant_type": "authorization_code",
             "code": code,
-            "redirect_uri": "https://bot-website-api.onrender.com/auth/callback",  # MUST match
+            "redirect_uri": DISCORD_REDIRECT_URI,
             "scope": "identify+guilds.members.read"
         }
-        
+
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        
+
         # Get access token from Discord
         token_response = requests.post(
             "https://discord.com/api/v10/oauth2/token",
             data=token_data,
             headers=headers
         )
-        
+
         if token_response.status_code != 200:
             logger.error(f"Token exchange failed: {token_response.text}")
             # Redirect to frontend with error
-            return RedirectResponse(url="http://localhost:5173/login?error=token_failed")
-        
+            err_target = frontend_target or ""
+            return RedirectResponse(url=f"{err_target}/login?error=token_failed")
+
         tokens = token_response.json()
         access_token = tokens.get("access_token")
-        
+
         # Get user info
         user_response = requests.get(
             "https://discord.com/api/v10/users/@me",
             headers={"Authorization": f"Bearer {access_token}"}
         )
-        
+
         if user_response.status_code != 200:
             logger.error(f"User info failed: {user_response.text}")
-            return RedirectResponse(url="http://localhost:5173/login?error=user_info_failed")
-        
+            err_target = frontend_target or ""
+            return RedirectResponse(url=f"{err_target}/login?error=user_info_failed")
+
         user_data = user_response.json()
-        
+
         # Create JWT token
         jwt_token = create_jwt_token({
             "discord_id": user_data["id"],
@@ -299,21 +352,47 @@ def discord_callback(code: str):
             "discriminator": user_data.get("discriminator"),
             "access_token": access_token
         })
-        
+
         logger.info(f"Created JWT token for user: {user_data['username']}")
-        
-        # For development:
-        frontend_url = "http://localhost:5173"
-        # For production, you might want to use an environment variable
-        
-        redirect_url = f"{frontend_url}/auth/redirect?token={jwt_token}"
-        
+
+        # If the caller asked for JSON (e.g., frontend exchanging code directly),
+        # return JSON with token and user info. Otherwise redirect browser to frontend.
+        # Determine via explicit `format=json` query param.
+        ask_json = False
+        try:
+            if format and str(format).lower() == "json":
+                ask_json = True
+            elif request and request.query_params.get("format", "").lower() == "json":
+                ask_json = True
+        except Exception:
+            ask_json = False
+
+        if ask_json:
+            return {
+                "token": jwt_token,
+                "user": {
+                    "discord_id": user_data.get("id"),
+                    "username": user_data.get("username"),
+                    "avatar": user_data.get("avatar")
+                }
+            }
+
+        # Build final redirect URL to frontend
+        if not frontend_target:
+            logger.error("No frontend target available for redirect")
+            raise HTTPException(status_code=500, detail="no_frontend_target")
+
+        redirect_url = f"{frontend_target.rstrip('/')}/auth/redirect?token={jwt_token}"
         logger.info(f"Redirecting to frontend: {redirect_url}")
         return RedirectResponse(url=redirect_url)
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error in discord_callback: {str(e)}")
-        return RedirectResponse(url="http://localhost:5173/login?error=server_error")
+        # Try to redirect back to a safe default
+        err_target = DEFAULT_FRONTEND or ""
+        return RedirectResponse(url=f"{err_target}/login?error=server_error")
 
         
 @app.get("/auth/me")
