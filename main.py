@@ -2,6 +2,8 @@
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import RedirectResponse
+from urllib.parse import urlparse  
 import os
 import requests
 import time
@@ -198,66 +200,87 @@ def discord_login():
     return {"auth_url": discord_auth_url}
 
 @app.get("/auth/callback")
-def discord_callback(code: str):
-    """Handle Discord OAuth2 callback"""
-    # Exchange code for access token
-    token_data = {
-        "client_id": DISCORD_CLIENT_ID,
-        "client_secret": DISCORD_CLIENT_SECRET,
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": DISCORD_REDIRECT_URI,
-        "scope": "identify+guilds.members.read"
-    }
-    
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
-    
-    response = requests.post(
-        "https://discord.com/api/v10/oauth2/token",
-        data=token_data,
-        headers=headers
-    )
-    
-    if response.status_code != 200:
-        logger.error(f"Discord token exchange failed: {response.text}")
-        raise HTTPException(status_code=400, detail="Failed to exchange code for token")
-    
-    tokens = response.json()
-    access_token = tokens.get("access_token")
-    
-    # Get user info from Discord
-    user_response = requests.get(
-        "https://discord.com/api/v10/users/@me",
-        headers={"Authorization": f"Bearer {access_token}"}
-    )
-    
-    if user_response.status_code != 200:
-        logger.error(f"Discord user info failed: {user_response.text}")
-        raise HTTPException(status_code=400, detail="Failed to get user info")
-    
-    user_data = user_response.json()
-    
-    # Create JWT token
-    jwt_token = create_jwt_token({
-        "discord_id": user_data["id"],
-        "username": user_data["username"],
-        "avatar": user_data.get("avatar"),
-        "discriminator": user_data.get("discriminator"),
-        "access_token": access_token
-    })
-    
-    return {
-        "token": jwt_token,
-        "user": {
-            "id": user_data["id"],
+@app.get("/auth/callback")
+def discord_callback(code: str, request: Request):
+    """Handle Discord OAuth2 callback and redirect back to frontend"""
+    try:
+        # Exchange code for access token
+        token_data = {
+            "client_id": DISCORD_CLIENT_ID,
+            "client_secret": DISCORD_CLIENT_SECRET,
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": DISCORD_REDIRECT_URI,
+            "scope": "identify+guilds.members.read"
+        }
+        
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        
+        response = requests.post(
+            "https://discord.com/api/v10/oauth2/token",
+            data=token_data,
+            headers=headers
+        )
+        
+        if response.status_code != 200:
+            logger.error(f"Discord token exchange failed: {response.text}")
+            # Redirect to frontend with error
+            return RedirectResponse(url=f"http://localhost:5173/login?error=auth_failed")
+        
+        tokens = response.json()
+        access_token = tokens.get("access_token")
+        
+        # Get user info from Discord
+        user_response = requests.get(
+            "https://discord.com/api/v10/users/@me",
+            headers={"Authorization": f"Bearer {access_token}"}
+        )
+        
+        if user_response.status_code != 200:
+            logger.error(f"Discord user info failed: {user_response.text}")
+            return RedirectResponse(url=f"http://localhost:5173/login?error=user_info_failed")
+        
+        user_data = user_response.json()
+        
+        # Create JWT token
+        jwt_token = create_jwt_token({
+            "discord_id": user_data["id"],
             "username": user_data["username"],
             "avatar": user_data.get("avatar"),
-            "discriminator": user_data.get("discriminator")
-        }
-    }
+            "discriminator": user_data.get("discriminator"),
+            "access_token": access_token
+        })
+        
+        # Determine frontend URL
+        # For development: localhost:5173
+        # For production: your actual frontend URL
+        frontend_base = "http://localhost:5173"
+        
+        # Check environment or use request headers
+        referer = request.headers.get("referer")
+        origin = request.headers.get("origin")
+        
+        if origin and ("localhost" in origin or "127.0.0.1" in origin):
+            frontend_base = origin
+        elif referer:
+            # Extract base URL from referer
+            from urllib.parse import urlparse
+            parsed = urlparse(referer)
+            frontend_base = f"{parsed.scheme}://{parsed.netloc}"
+        
+        # Create redirect URL with token
+        redirect_url = f"{frontend_base}/auth/redirect?token={jwt_token}"
+        
+        logger.info(f"Redirecting to: {redirect_url}")
+        return RedirectResponse(url=redirect_url)
+        
+    except Exception as e:
+        logger.error(f"Error in discord_callback: {e}")
+        return RedirectResponse(url=f"http://localhost:5173/login?error=server_error")
 
+        
 @app.get("/auth/me")
 async def get_current_user_info(user: dict = Depends(get_current_user)):
     """Get current user info"""
