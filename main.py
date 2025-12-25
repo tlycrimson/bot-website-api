@@ -343,9 +343,9 @@ def discord_callback(code: str, state: Optional[str] = None, request: Request = 
         logger.info(f"Discord callback received. Code: {code[:20]}... state={state}")
 
         # Pop mapping for state (one-time use)
-            mapping = None
-            if state:
-                mapping = _pop_oauth_state(state)
+        mapping = None
+        if state:
+            mapping = _pop_oauth_state(state)
         # Fallback frontend target
         frontend_target = (mapping.get("next") if mapping else None) or DEFAULT_FRONTEND
         if ALLOWED_FRONTEND_ORIGINS and frontend_target and frontend_target not in ALLOWED_FRONTEND_ORIGINS:
