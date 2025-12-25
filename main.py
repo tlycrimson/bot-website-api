@@ -1,12 +1,16 @@
-# main.py
-from fastapi import FastAPI, HTTPException
+# main.py - Add these imports
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import os
 import requests
+import jwt
+import time
 from typing import Optional, List
 
 app = FastAPI()
 
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -15,203 +19,225 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Get Supabase credentials from environment
+import os
+
+# Get all environment variables
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")
+DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
+DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID")
+HICOM_ROLE_ID = os.getenv("HICOM_ROLE_ID")
+DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI", "https://bot-website-api.onrender.com/auth/callback")
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
+ADMIN_DISCORD_ID = "353167234698444802"  # Your Discord ID
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("Missing Supabase credentials")
+# Validate
+required_vars = {
+    "SUPABASE_URL": SUPABASE_URL,
+    "SUPABASE_ANON_KEY": SUPABASE_KEY,
+    "DISCORD_CLIENT_ID": DISCORD_CLIENT_ID,
+    "DISCORD_CLIENT_SECRET": DISCORD_CLIENT_SECRET,
+    "DISCORD_BOT_TOKEN": DISCORD_BOT_TOKEN,
+    "DISCORD_GUILD_ID": DISCORD_GUILD_ID,
+    "HICOM_ROLE_ID": HICOM_ROLE_ID,
+}
 
-# Headers for Supabase REST API
+missing_vars = [name for name, value in required_vars.items() if not value]
+if missing_vars:
+    raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+
+logger.info("All environment variables loaded successfully!")
+
+# Security
+security = HTTPBearer()
+
+# Headers for Supabase
 HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
-    "Content-Type": "application/json",
-    "Prefer": "return=representation"  # This ensures PATCH returns the updated record
+    "Content-Type": "application/json"
 }
 
-# Helper function to make Supabase requests
-def supabase_request(method, table, data=None, params=None, record_id=None):
-    url = f"{SUPABASE_URL}/rest/v1/{table}"
+# ============ AUTHENTICATION HELPERS ============
+
+def create_jwt_token(user_data: dict) -> str:
+    """Create a JWT token for authenticated user"""
+    payload = {
+        **user_data,
+        "exp": time.time() + 3600,  # 1 hour expiration
+        "iat": time.time()
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+
+def verify_jwt_token(token: str) -> Optional[dict]:
+    """Verify and decode JWT token"""
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        return payload
+    except:
+        return None
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Dependency to get current user from JWT token"""
+    token = credentials.credentials
+    user = verify_jwt_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return user
+
+async def is_admin_or_hicom(user: dict = Depends(get_current_user)):
+    """Check if user is admin or has HICOM role"""
+    # Check if user is you (admin)
+    if user.get("discord_id") == ADMIN_DISCORD_ID:
+        return user
     
-    # record_id always refers to the user_id column in our tables
-    if record_id is not None:
-        url = f"{url}?user_id=eq.{record_id}"
+    # Check HICOM role via Discord API
+    headers = {
+        "Authorization": f"Bearer {DISCORD_BOT_TOKEN}"
+    }
     
-    response = requests.request(
-        method=method,
-        url=url,
-        headers=HEADERS,
-        json=data,
-        params=params
+    # Get user's roles in the guild
+    try:
+        response = requests.get(
+            f"https://discord.com/api/v10/guilds/{DISCORD_GUILD_ID}/members/{user.get('discord_id')}",
+            headers=headers
+        )
+        
+        if response.status_code == 200:
+            member_data = response.json()
+            roles = member_data.get("roles", [])
+            
+            # Check if user has HICOM role
+            # You'll need to replace "HICOM_ROLE_ID" with your actual HICOM role ID
+            HICOM_ROLE_ID = os.getenv("HICOM_ROLE_ID")
+            if HICOM_ROLE_ID and HICOM_ROLE_ID in roles:
+                return user
+    except:
+        pass
+    
+    raise HTTPException(status_code=403, detail="Access denied. Requires HICOM role or admin privileges.")
+
+# ============ DISCORD OAUTH ENDPOINTS ============
+
+@app.get("/auth/discord/login")
+def discord_login():
+    """Redirect to Discord OAuth2"""
+    discord_auth_url = (
+        f"https://discord.com/api/oauth2/authorize"
+        f"?client_id={DISCORD_CLIENT_ID}"
+        f"&redirect_uri={os.getenv('DISCORD_REDIRECT_URI', 'http://localhost:5173/auth/callback')}"
+        f"&response_type=code"
+        f"&scope=identify+guilds.members.read"
+    )
+    return {"auth_url": discord_auth_url}
+
+@app.get("/auth/callback")
+def discord_callback(code: str):
+    """Handle Discord OAuth2 callback"""
+    # Exchange code for access token
+    token_data = {
+        "client_id": DISCORD_CLIENT_ID,
+        "client_secret": DISCORD_CLIENT_SECRET,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": os.getenv("DISCORD_REDIRECT_URI", "http://localhost:5173/auth/callback"),
+        "scope": "identify+guilds.members.read"
+    }
+    
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    
+    response = requests.post(
+        "https://discord.com/api/v10/oauth2/token",
+        data=token_data,
+        headers=headers
     )
     
-    if response.status_code >= 400:
-        raise HTTPException(
-            status_code=response.status_code,
-            detail=f"Supabase error: {response.text}"
-        )
+    if response.status_code != 200:
+        raise HTTPException(status_code=400, detail="Failed to exchange code for token")
     
-    # For PATCH/DELETE operations that might return empty response
-    if response.status_code == 204 or response.text == "":
-        if method == "DELETE":
-            return {"success": True, "message": "Record deleted successfully"}
-        elif method == "PATCH":
-            return {"success": True, "message": "Record updated successfully"}
-        else:
-            return {"success": True}
+    tokens = response.json()
+    access_token = tokens.get("access_token")
     
-    try:
-        return response.json()
-    except:
-        # If we can't parse JSON, return success message
-        if method == "DELETE":
-            return {"success": True, "message": "Record deleted successfully"}
-        elif method == "PATCH":
-            return {"success": True, "message": "Record updated successfully"}
-        else:
-            return {"success": True, "message": "Operation completed"}
-
-@app.get("/")
-def root():
-    return {"message": "Bot API is running"}
-
-# ============ GET ENDPOINTS ============
-
-@app.get("/leaderboard")
-def leaderboard():
-    """Get all XP users for admin panel"""
-    params = {
-        "select": "user_id,username,xp",
-        "order": "xp.desc"
+    # Get user info from Discord
+    user_response = requests.get(
+        "https://discord.com/api/v10/users/@me",
+        headers={"Authorization": f"Bearer {access_token}"}
+    )
+    
+    if user_response.status_code != 200:
+        raise HTTPException(status_code=400, detail="Failed to get user info")
+    
+    user_data = user_response.json()
+    
+    # Create JWT token
+    jwt_token = create_jwt_token({
+        "discord_id": user_data["id"],
+        "username": user_data["username"],
+        "avatar": user_data.get("avatar"),
+        "discriminator": user_data.get("discriminator"),
+        "access_token": access_token
+    })
+    
+    return {
+        "token": jwt_token,
+        "user": {
+            "id": user_data["id"],
+            "username": user_data["username"],
+            "avatar": user_data.get("avatar"),
+            "discriminator": user_data.get("discriminator")
+        }
     }
-    return supabase_request("GET", "users", params=params)
 
+@app.get("/auth/me")
+async def get_current_user_info(user: dict = Depends(get_current_user)):
+    """Get current user info"""
+    return {
+        "user": {
+            "discord_id": user.get("discord_id"),
+            "username": user.get("username"),
+            "avatar": user.get("avatar"),
+            "discriminator": user.get("discriminator")
+        },
+        "is_admin": user.get("discord_id") == ADMIN_DISCORD_ID
+    }
+
+@app.get("/auth/check-permissions")
+async def check_permissions(user: dict = Depends(is_admin_or_hicom)):
+    """Check if user has admin/HICOM permissions"""
+    return {
+        "authorized": True,
+        "user": {
+            "discord_id": user.get("discord_id"),
+            "username": user.get("username")
+        },
+        "is_admin": user.get("discord_id") == ADMIN_DISCORD_ID
+    }
+
+# ============ PROTECTED ENDPOINTS ============
+
+# Update ALL your existing endpoints to use the dependency
+# Example for /hr endpoint:
 @app.get("/hr")
-def get_hr():
-    """Get all HR users"""
+def get_hr(user: dict = Depends(is_admin_or_hicom)):
+    """Get all HR users (protected)"""
     params = {"order": "user_id"}
     return supabase_request("GET", "HRs", params=params)
 
-@app.get("/lr")
-def get_lr():
-    """Get all LR users"""
-    params = {"order": "user_id"}
-    return supabase_request("GET", "LRs", params=params)
+# Do the same for ALL other endpoints:
+# - /lr
+# - /leaderboard
+# - POST/PATCH/DELETE endpoints
 
-# ============ CREATE ENDPOINTS ============
-
-# Allowed columns per table
-HR_COLUMNS = {
-    "user_id",
-    "username",
-    "tryouts",
-    "events",
-    "phases",
-    "courses",
-    "inspections",
-    "joint_events",
-    "division",
-    "rank",
-}
-
-LR_COLUMNS = {
-    "user_id",
-    "username",
-    "activity",
-    "time_guarded",
-    "events_attended",
-    "division",
-    "rank",
-}
-
-USER_COLUMNS = {
-    "user_id",
-    "username",
-    "xp",
-}
-
-def _filter_payload(data: dict, allowed_keys: set[str]) -> dict:
-    """Return a copy of data containing only keys that exist in the table."""
-    return {k: v for k, v in data.items() if k in allowed_keys}
-
-@app.post("/hr")
-def create_hr(data: dict):
-    """Create a new HR row."""
-    if "username" not in data or "user_id" not in data:
-        raise HTTPException(status_code=400, detail="Missing required field: user_id or username")
-
-    payload = _filter_payload(data, HR_COLUMNS)
-    return supabase_request("POST", "HRs", data=payload)
-
-@app.post("/lr")
-def create_lr(data: dict):
-    """Create a new LR row."""
-    if "username" not in data or "user_id" not in data:
-        raise HTTPException(status_code=400, detail="Missing required field: user_id or username")
-
-    payload = _filter_payload(data, LR_COLUMNS)
-    return supabase_request("POST", "LRs", data=payload)
-
-@app.post("/users")
-def create_user(data: dict):
-    """Create a new user (XP entry)."""
-    if "username" not in data or "user_id" not in data:
-        raise HTTPException(status_code=400, detail="Missing required field: user_id or username")
-
-    payload = _filter_payload(data, USER_COLUMNS)
-    return supabase_request("POST", "users", data=payload)
-
-# ============ UPDATE ENDPOINTS ============
-
-@app.patch("/hr/{user_id}")
-def update_hr(user_id: str, data: dict):
-    """Update an HR row."""
-    payload = _filter_payload(data, HR_COLUMNS)
-    if not payload:
-        raise HTTPException(status_code=400, detail="No valid fields to update for HR")
-    return supabase_request("PATCH", "HRs", data=payload, record_id=user_id)
-
-@app.patch("/lr/{user_id}")
-def update_lr(user_id: str, data: dict):
-    """Update an LR row."""
-    payload = _filter_payload(data, LR_COLUMNS)
-    if not payload:
-        raise HTTPException(status_code=400, detail="No valid fields to update for LR")
-    return supabase_request("PATCH", "LRs", data=payload, record_id=user_id)
-
-@app.patch("/users/{user_id}")
-def update_user(user_id: str, data: dict):
-    """Update a user's XP or username."""
-    payload = _filter_payload(data, USER_COLUMNS)
-    if not payload:
-        raise HTTPException(status_code=400, detail="No valid fields to update for user")
-    return supabase_request("PATCH", "users", data=payload, record_id=user_id)
-
-# ============ DELETE ENDPOINTS ============
-
-@app.delete("/hr/{user_id}")
-def delete_hr(user_id: str):
-    """Delete an HR row"""
-    return supabase_request("DELETE", "HRs", record_id=user_id)
-
-@app.delete("/lr/{user_id}")
-def delete_lr(user_id: str):
-    """Delete an LR row"""
-    return supabase_request("DELETE", "LRs", record_id=user_id)
-
-@app.delete("/users/{user_id}")
-def delete_user(user_id: str):
-    """Delete a user row"""
-    return supabase_request("DELETE", "users", record_id=user_id)
-
-# ============ HEALTH CHECK ============
+# Keep the helper functions from before (supabase_request, etc.)
 
 @app.get("/health")
 def health_check():
-    """Health check endpoint"""
+    """Public health check"""
     try:
-        # Test Supabase connection
         response = requests.get(f"{SUPABASE_URL}/rest/v1/", headers=HEADERS)
         if response.status_code == 200:
             return {"status": "healthy", "supabase": "connected"}
