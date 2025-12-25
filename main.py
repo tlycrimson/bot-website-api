@@ -484,3 +484,189 @@ def health_check():
             return {"status": "unhealthy", "supabase": f"error: {response.status_code}"}
     except Exception as e:
         return {"status": "unhealthy", "error": str(e)}
+
+# ============ HIERARCHY ENDPOINTS ============
+
+# Allowed columns for hierarchy tables
+HIERARCHY_SECTION_COLUMNS = {
+    "section_title",
+    "section_type",
+    "accent_color", 
+    "display_order",
+    "is_active"
+}
+
+HIERARCHY_ENTRY_COLUMNS = {
+    "section_id",
+    "rank",
+    "username",
+    "army_rank",
+    "roblox_id",
+    "requirements",
+    "display_order"
+}
+
+HIERARCHY_HEADER_COLUMNS = {
+    "section_id",
+    "header_text",
+    "display_order"
+}
+
+# Get all hierarchy data (public - no auth required)
+@app.get("/hierarchy")
+async def get_hierarchy():
+    """Get all hierarchy data for display"""
+    try:
+        # Get all active sections
+        sections_params = {
+            "select": "id,section_title,section_type,accent_color,display_order",
+            "order": "display_order",
+            "is_active": "eq.true"
+        }
+        sections = supabase_request("GET", "hierarchy_sections", params=sections_params)
+        
+        result = []
+        for section in sections:
+            # Get headers for this section
+            headers_params = {
+                "select": "header_text,display_order",
+                "order": "display_order",
+                "section_id": f"eq.{section['id']}"
+            }
+            headers = supabase_request("GET", "hierarchy_headers", params=headers_params)
+            
+            # Get entries for this section
+            entries_params = {
+                "select": "rank,username,army_rank,roblox_id,requirements,display_order",
+                "order": "display_order",
+                "section_id": f"eq.{section['id']}"
+            }
+            entries = supabase_request("GET", "hierarchy_entries", params=entries_params)
+            
+            result.append({
+                "section": section,
+                "headers": headers,
+                "entries": entries
+            })
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Failed to fetch hierarchy: {e}")
+        return []
+
+# Get hierarchy data for admin panel (with auth)
+@app.get("/admin/hierarchy")
+async def get_hierarchy_admin(user: dict = Depends(is_admin_or_hicom)):
+    """Get all hierarchy data for admin editing"""
+    try:
+        # Get all sections (including inactive)
+        sections = supabase_request("GET", "hierarchy_sections", params={"order": "display_order"})
+        
+        result = []
+        for section in sections:
+            # Get headers
+            headers_params = {
+                "select": "id,header_text,display_order",
+                "order": "display_order",
+                "section_id": f"eq.{section['id']}"
+            }
+            headers = supabase_request("GET", "hierarchy_headers", params=headers_params)
+            
+            # Get entries
+            entries_params = {
+                "select": "id,rank,username,army_rank,roblox_id,requirements,display_order",
+                "order": "display_order", 
+                "section_id": f"eq.{section['id']}"
+            }
+            entries = supabase_request("GET", "hierarchy_entries", params=entries_params)
+            
+            result.append({
+                "section": section,
+                "headers": headers,
+                "entries": entries
+            })
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Failed to fetch admin hierarchy: {e}")
+        raise HTTPException(status_code=500, detail="Failed to load hierarchy data")
+
+# Create new hierarchy section
+@app.post("/admin/hierarchy/sections")
+async def create_hierarchy_section(data: dict, user: dict = Depends(is_admin_or_hicom)):
+    """Create a new hierarchy section"""
+    payload = _filter_payload(data, HIERARCHY_SECTION_COLUMNS)
+    if not payload.get("section_title") or not payload.get("section_type"):
+        raise HTTPException(status_code=400, detail="Missing required fields")
+    
+    return supabase_request("POST", "hierarchy_sections", data=payload)
+
+# Update hierarchy section
+@app.patch("/admin/hierarchy/sections/{section_id}")
+async def update_hierarchy_section(section_id: str, data: dict, user: dict = Depends(is_admin_or_hicom)):
+    """Update a hierarchy section"""
+    payload = _filter_payload(data, HIERARCHY_SECTION_COLUMNS)
+    if not payload:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+    
+    return supabase_request("PATCH", "hierarchy_sections", data=payload, record_id=section_id)
+
+# Delete hierarchy section
+@app.delete("/admin/hierarchy/sections/{section_id}")
+async def delete_hierarchy_section(section_id: str, user: dict = Depends(is_admin_or_hicom)):
+    """Delete a hierarchy section and its related data"""
+    return supabase_request("DELETE", "hierarchy_sections", record_id=section_id)
+
+# Create hierarchy entry
+@app.post("/admin/hierarchy/entries")
+async def create_hierarchy_entry(data: dict, user: dict = Depends(is_admin_or_hicom)):
+    """Create a new hierarchy entry (person or quota)"""
+    payload = _filter_payload(data, HIERARCHY_ENTRY_COLUMNS)
+    if not payload.get("section_id") or not payload.get("rank"):
+        raise HTTPException(status_code=400, detail="Missing required fields")
+    
+    return supabase_request("POST", "hierarchy_entries", data=payload)
+
+# Update hierarchy entry
+@app.patch("/admin/hierarchy/entries/{entry_id}")
+async def update_hierarchy_entry(entry_id: str, data: dict, user: dict = Depends(is_admin_or_hicom)):
+    """Update a hierarchy entry"""
+    payload = _filter_payload(data, HIERARCHY_ENTRY_COLUMNS)
+    if not payload:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+    
+    return supabase_request("PATCH", "hierarchy_entries", data=payload, record_id=entry_id)
+
+# Delete hierarchy entry
+@app.delete("/admin/hierarchy/entries/{entry_id}")
+async def delete_hierarchy_entry(entry_id: str, user: dict = Depends(is_admin_or_hicom)):
+    """Delete a hierarchy entry"""
+    return supabase_request("DELETE", "hierarchy_entries", record_id=entry_id)
+
+# Create hierarchy header
+@app.post("/admin/hierarchy/headers")
+async def create_hierarchy_header(data: dict, user: dict = Depends(is_admin_or_hicom)):
+    """Create headers for a hierarchy section"""
+    payload = _filter_payload(data, HIERARCHY_HEADER_COLUMNS)
+    if not payload.get("section_id") or not payload.get("header_text"):
+        raise HTTPException(status_code=400, detail="Missing required fields")
+    
+    return supabase_request("POST", "hierarchy_headers", data=payload)
+
+# Update hierarchy header
+@app.patch("/admin/hierarchy/headers/{header_id}")
+async def update_hierarchy_header(header_id: str, data: dict, user: dict = Depends(is_admin_or_hicom)):
+    """Update a hierarchy header"""
+    payload = _filter_payload(data, HIERARCHY_HEADER_COLUMNS)
+    if not payload:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+    
+    return supabase_request("PATCH", "hierarchy_headers", data=payload, record_id=header_id)
+
+# Delete hierarchy header
+@app.delete("/admin/hierarchy/headers/{header_id}")
+async def delete_hierarchy_header(header_id: str, user: dict = Depends(is_admin_or_hicom)):
+    """Delete a hierarchy header"""
+    return supabase_request("DELETE", "hierarchy_headers", record_id=header_id)
