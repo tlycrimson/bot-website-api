@@ -67,30 +67,77 @@ HEADERS = {
 # ============ HELPER FUNCTIONS ============
 
 def supabase_request(method, table, data=None, params=None, record_id=None):
-    """Your existing supabase_request function"""
+    """Make a request to Supabase REST API"""
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     
+    # For DELETE operations with record_id
     if record_id is not None:
-        url = f"{url}?user_id=eq.{record_id}"
+        if method == "DELETE":
+            url = f"{url}?id=eq.{record_id}"
+        else:
+            # For PATCH operations on hierarchy tables
+            url = f"{url}?id=eq.{record_id}"
     
-    response = requests.request(
-        method=method,
-        url=url,
-        headers=HEADERS,
-        json=data,
-        params=params
-    )
+    logger.info(f"Supabase request: {method} {url}")
+    if data:
+        logger.info(f"Request data: {data}")
     
-    if response.status_code >= 400:
-        raise HTTPException(
-            status_code=response.status_code,
-            detail=f"Supabase error: {response.text}"
+    try:
+        response = requests.request(
+            method=method,
+            url=url,
+            headers=HEADERS,
+            json=data,
+            params=params
         )
-    
-    if method == "DELETE":
-        return {"success": True}
-    
-    return response.json()
+        
+        logger.info(f"Supabase response status: {response.status_code}")
+        logger.info(f"Supabase response text: {response.text[:500]}")
+        
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"Supabase error: {response.text}"
+            )
+        
+        # Handle empty responses (204 No Content or empty body)
+        if response.status_code == 204 or not response.text.strip():
+            if method == "DELETE":
+                return {"success": True, "message": "Record deleted successfully"}
+            elif method == "POST":
+                # For POST, we might want to return the inserted record
+                # Try to fetch the latest record if possible
+                try:
+                    # Try to get the record we just created by fetching latest
+                    fetch_params = {"order": "created_at.desc", "limit": 1}
+                    fetch_response = requests.get(url, headers=HEADERS, params=fetch_params)
+                    if fetch_response.status_code == 200 and fetch_response.text.strip():
+                        result = fetch_response.json()
+                        if result and len(result) > 0:
+                            return result[0]
+                except Exception as fetch_error:
+                    logger.warning(f"Could not fetch created record: {fetch_error}")
+                
+                return {"success": True, "message": "Record created successfully"}
+            elif method == "PATCH":
+                return {"success": True, "message": "Record updated successfully"}
+            else:
+                return {"success": True}
+        
+        # Try to parse JSON response
+        try:
+            return response.json()
+        except json.JSONDecodeError:
+            # If it's not valid JSON but we have content, return as text
+            if response.text:
+                return {"message": response.text, "success": True}
+            return {"success": True}
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Supabase request failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Database request failed: {str(e)}")
 
 def _filter_payload(data: dict, allowed_keys: set[str]) -> dict:
     """Your existing _filter_payload function"""
