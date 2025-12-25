@@ -200,47 +200,47 @@ def discord_login():
     return {"auth_url": discord_auth_url}
 
 @app.get("/auth/callback")
-@app.get("/auth/callback")
-def discord_callback(code: str, request: Request):
-    """Handle Discord OAuth2 callback and redirect back to frontend"""
+def discord_callback(code: str):
+    """Handle Discord OAuth2 callback - redirect to frontend with token"""
     try:
+        logger.info(f"Discord callback received. Code: {code[:20]}...")
+        
         # Exchange code for access token
         token_data = {
             "client_id": DISCORD_CLIENT_ID,
             "client_secret": DISCORD_CLIENT_SECRET,
             "grant_type": "authorization_code",
             "code": code,
-            "redirect_uri": DISCORD_REDIRECT_URI,
+            "redirect_uri": "https://bot-website-api.onrender.com/auth/callback",  # MUST match
             "scope": "identify+guilds.members.read"
         }
         
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded"
-        }
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
         
-        response = requests.post(
+        # Get access token from Discord
+        token_response = requests.post(
             "https://discord.com/api/v10/oauth2/token",
             data=token_data,
             headers=headers
         )
         
-        if response.status_code != 200:
-            logger.error(f"Discord token exchange failed: {response.text}")
+        if token_response.status_code != 200:
+            logger.error(f"Token exchange failed: {token_response.text}")
             # Redirect to frontend with error
-            return RedirectResponse(url=f"http://localhost:5173/login?error=auth_failed")
+            return RedirectResponse(url="http://localhost:5173/login?error=token_failed")
         
-        tokens = response.json()
+        tokens = token_response.json()
         access_token = tokens.get("access_token")
         
-        # Get user info from Discord
+        # Get user info
         user_response = requests.get(
             "https://discord.com/api/v10/users/@me",
             headers={"Authorization": f"Bearer {access_token}"}
         )
         
         if user_response.status_code != 200:
-            logger.error(f"Discord user info failed: {user_response.text}")
-            return RedirectResponse(url=f"http://localhost:5173/login?error=user_info_failed")
+            logger.error(f"User info failed: {user_response.text}")
+            return RedirectResponse(url="http://localhost:5173/login?error=user_info_failed")
         
         user_data = user_response.json()
         
@@ -253,32 +253,20 @@ def discord_callback(code: str, request: Request):
             "access_token": access_token
         })
         
-        # Determine frontend URL
-        # For development: localhost:5173
-        # For production: your actual frontend URL
-        frontend_base = "http://localhost:5173"
+        logger.info(f"Created JWT token for user: {user_data['username']}")
         
-        # Check environment or use request headers
-        referer = request.headers.get("referer")
-        origin = request.headers.get("origin")
+        # For development:
+        frontend_url = "http://localhost:5173"
+        # For production, you might want to use an environment variable
         
-        if origin and ("localhost" in origin or "127.0.0.1" in origin):
-            frontend_base = origin
-        elif referer:
-            # Extract base URL from referer
-            from urllib.parse import urlparse
-            parsed = urlparse(referer)
-            frontend_base = f"{parsed.scheme}://{parsed.netloc}"
+        redirect_url = f"{frontend_url}/auth/redirect?token={jwt_token}"
         
-        # Create redirect URL with token
-        redirect_url = f"{frontend_base}/auth/redirect?token={jwt_token}"
-        
-        logger.info(f"Redirecting to: {redirect_url}")
+        logger.info(f"Redirecting to frontend: {redirect_url}")
         return RedirectResponse(url=redirect_url)
         
     except Exception as e:
-        logger.error(f"Error in discord_callback: {e}")
-        return RedirectResponse(url=f"http://localhost:5173/login?error=server_error")
+        logger.error(f"Error in discord_callback: {str(e)}")
+        return RedirectResponse(url="http://localhost:5173/login?error=server_error")
 
         
 @app.get("/auth/me")
