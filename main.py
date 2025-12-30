@@ -594,6 +594,16 @@ USER_COLUMNS = {
     "xp",
 }
 
+WELCOME_MESSAGE_COLUMNS = {
+    "id",
+    "message_type", 
+    "version",
+    "is_active",
+    "last_updated",
+    "updated_by",
+    "embeds"
+}
+
 @app.post("/hr")
 async def create_hr(data: dict, user: dict = Depends(is_admin_or_hicom)):
     """Create a new HR row."""
@@ -863,3 +873,277 @@ async def update_hierarchy_header(header_id: str, data: dict, user: dict = Depen
 async def delete_hierarchy_header(header_id: str, user: dict = Depends(is_admin_or_hicom)):
     """Delete a hierarchy header"""
     return supabase_request("DELETE", "hierarchy_headers", record_id=header_id)
+
+# ============ WELCOME MESSAGES ENDPOINTS ============
+
+# PUBLIC endpoint - no authentication required
+@app.get("/public/welcome-messages")
+async def get_welcome_messages(message_type: Optional[str] = None):
+    """
+    Get active welcome messages.
+    Optional query param: message_type (rmp_welcome or hr_welcome)
+    Only returns active messages.
+    """
+    try:
+        params = {
+            "select": "id,message_type,version,embeds,last_updated,updated_by",
+            "order": "version.desc",  # Show latest version first
+            "is_active": "eq.true"  # Only active messages
+        }
+        
+        # Filter by message_type if provided
+        if message_type:
+            if message_type not in ["rmp_welcome", "hr_welcome"]:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="message_type must be either 'rmp_welcome' or 'hr_welcome'"
+                )
+            params["message_type"] = f"eq.{message_type}"
+        
+        return supabase_request("GET", "welcome_messages", params=params)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to fetch welcome messages: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch welcome messages")
+
+# ============ ADMIN WELCOME MESSAGES ENDPOINTS ============
+
+# Get all welcome messages (including inactive) - for admin panel
+@app.get("/admin/welcome-messages")
+async def get_all_welcome_messages(user: dict = Depends(is_admin_or_hicom)):
+    """Get all welcome messages including inactive versions for admin panel"""
+    try:
+        params = {
+            "select": "*",
+            "order": "message_type,version.desc"
+        }
+        return supabase_request("GET", "welcome_messages", params=params)
+    except Exception as e:
+        logger.error(f"Failed to fetch all welcome messages: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch welcome messages")
+
+# Get welcome message by ID
+@app.get("/admin/welcome-messages/{message_id}")
+async def get_welcome_message_by_id(message_id: str, user: dict = Depends(is_admin_or_hicom)):
+    """Get specific welcome message by ID"""
+    try:
+        params = {
+            "select": "*",
+            "id": f"eq.{message_id}"
+        }
+        result = supabase_request("GET", "welcome_messages", params=params)
+        
+        if not result:
+            raise HTTPException(status_code=404, detail="Welcome message not found")
+        
+        return result[0] if isinstance(result, list) else result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to fetch welcome message: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch welcome message")
+
+# Create new welcome message
+@app.post("/admin/welcome-messages")
+async def create_welcome_message(data: dict, user: dict = Depends(is_admin_or_hicom)):
+    """Create a new welcome message"""
+    # Validate required fields
+    required_fields = ["message_type", "version", "embeds"]
+    for field in required_fields:
+        if field not in data:
+            raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
+    
+    # Validate message_type
+    if data["message_type"] not in ["rmp_welcome", "hr_welcome"]:
+        raise HTTPException(
+            status_code=400, 
+            detail="message_type must be either 'rmp_welcome' or 'hr_welcome'"
+        )
+    
+    # Add metadata
+    payload = _filter_payload(data, WELCOME_MESSAGE_COLUMNS)
+    payload["updated_by"] = user.get("username", "Unknown")
+    payload["last_updated"] = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+    
+    # Set is_active to false by default for new versions
+    # Admin can activate it manually after creation
+    payload["is_active"] = False
+    
+    return supabase_request("POST", "welcome_messages", data=payload)
+
+# Update welcome message
+@app.patch("/admin/welcome-messages/{message_id}")
+async def update_welcome_message(message_id: str, data: dict, user: dict = Depends(is_admin_or_hicom)):
+    """Update an existing welcome message"""
+    payload = _filter_payload(data, WELCOME_MESSAGE_COLUMNS)
+    
+    if not payload:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+    
+    # Add metadata
+    payload["updated_by"] = user.get("username", "Unknown")
+    payload["last_updated"] = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+    
+    return supabase_request("PATCH", "welcome_messages", data=payload, record_id=message_id)
+
+# Delete welcome message
+@app.delete("/admin/welcome-messages/{message_id}")
+async def delete_welcome_message(message_id: str, user: dict = Depends(is_admin_or_hicom)):
+    """Delete a welcome message"""
+    return supabase_request("DELETE", "welcome_messages", record_id=message_id)
+
+# Activate a specific welcome message version
+@app.post("/admin/welcome-messages/{message_id}/activate")
+async def activate_welcome_message(message_id: str, user: dict = Depends(is_admin_or_hicom)):
+    """
+    Activate a specific welcome message version.
+    This will deactivate all other versions of the same message_type.
+    """
+    try:
+        # First, get the message to know its type
+        params = {"id": f"eq.{message_id}"}
+        messages = supabase_request("GET", "welcome_messages", params=params)
+        
+        if not messages or not isinstance(messages, list) or len(messages) == 0:
+            raise HTTPException(status_code=404, detail="Welcome message not found")
+        
+        message = messages[0]
+        message_type = message.get("message_type")
+        
+        if not message_type:
+            raise HTTPException(status_code=400, detail="Message type not found")
+        
+        # Deactivate all messages of this type
+        deactivate_payload = {
+            "is_active": False,
+            "updated_by": user.get("username", "Unknown"),
+            "last_updated": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+        }
+        
+        # Update all messages of this type to inactive
+        deactivate_params = {
+            "message_type": f"eq.{message_type}",
+            "is_active": "eq.true"
+        }
+        
+        # First get all active messages of this type
+        active_messages = supabase_request(
+            "GET", 
+            "welcome_messages", 
+            params={"message_type": f"eq.{message_type}", "is_active": "eq.true"}
+        )
+        
+        # Update each one to inactive (except our target if it's active)
+        if active_messages and isinstance(active_messages, list):
+            for active_msg in active_messages:
+                if str(active_msg.get("id")) != message_id:
+                    supabase_request(
+                        "PATCH", 
+                        "welcome_messages", 
+                        data=deactivate_payload, 
+                        record_id=str(active_msg.get("id"))
+                    )
+        
+        # Activate the target message
+        activate_payload = {
+            "is_active": True,
+            "updated_by": user.get("username", "Unknown"),
+            "last_updated": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+        }
+        
+        result = supabase_request(
+            "PATCH", 
+            "welcome_messages", 
+            data=activate_payload, 
+            record_id=message_id
+        )
+        
+        return {
+            "success": True,
+            "message": f"Activated version {message.get('version')} of {message_type} message",
+            "data": result
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to activate welcome message: {e}")
+        raise HTTPException(status_code=500, detail="Failed to activate welcome message")
+
+# Get active welcome message by type
+@app.get("/admin/welcome-messages/type/{message_type}")
+async def get_active_welcome_message_by_type(message_type: str, user: dict = Depends(is_admin_or_hicom)):
+    """Get the currently active welcome message for a specific type"""
+    if message_type not in ["rmp_welcome", "hr_welcome"]:
+        raise HTTPException(
+            status_code=400, 
+            detail="message_type must be either 'rmp_welcome' or 'hr_welcome'"
+        )
+    
+    try:
+        params = {
+            "select": "*",
+            "message_type": f"eq.{message_type}",
+            "is_active": "eq.true",
+            "order": "version.desc",
+            "limit": "1"
+        }
+        
+        result = supabase_request("GET", "welcome_messages", params=params)
+        
+        if not result or not isinstance(result, list) or len(result) == 0:
+            return {"active_message": None, "message": f"No active {message_type} message found"}
+        
+        return {
+            "active_message": result[0],
+            "all_versions": supabase_request(
+                "GET", 
+                "welcome_messages", 
+                params={
+                    "select": "id,version,is_active,last_updated,updated_by",
+                    "message_type": f"eq.{message_type}",
+                    "order": "version.desc"
+                }
+            )
+        }
+    except Exception as e:
+        logger.error(f"Failed to fetch active welcome message: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch active welcome message")
+
+# Add this with other public endpoints (around line 300-350)
+@app.get("/public/welcome-messages/{message_type}")
+async def get_active_welcome_message_by_type_public(message_type: str):
+    """
+    Get the currently active welcome message for a specific type.
+    Public endpoint - no authentication required.
+    """
+    if message_type not in ["rmp_welcome", "hr_welcome"]:
+        raise HTTPException(
+            status_code=400, 
+            detail="message_type must be either 'rmp_welcome' or 'hr_welcome'"
+        )
+    
+    try:
+        params = {
+            "select": "message_type,version,embeds,last_updated",
+            "message_type": f"eq.{message_type}",
+            "is_active": "eq.true",
+            "order": "version.desc",
+            "limit": "1"
+        }
+        
+        result = supabase_request("GET", "welcome_messages", params=params)
+        
+        if not result or not isinstance(result, list) or len(result) == 0:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"No active {message_type} message found"
+            )
+        
+        return result[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to fetch active welcome message: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch welcome message")
