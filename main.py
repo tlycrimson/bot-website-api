@@ -212,6 +212,15 @@ def _pop_oauth_state(state: str) -> Optional[dict]:
     # Fallback
     return state_map.pop(state, None)
 
+def validate_section_type(section_type: str):
+    """Validate that section_type is valid"""
+    valid_types = ['commanding', 'divisional', 'sergeants', 'quota', 'documents']
+    if section_type not in valid_types:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid section_type. Must be one of: {', '.join(valid_types)}"
+        )
+
 # ============ AUTHENTICATION HELPERS ============
 
 # Try to import JWT, but provide a fallback if not installed
@@ -720,9 +729,9 @@ HIERARCHY_HEADER_COLUMNS = {
 async def get_hierarchy():
     """Get all hierarchy data for display"""
     try:
-        # Get all active sections - ADD is_active to select
+        # Get all active sections
         sections_params = {
-            "select": "id,section_title,section_type,accent_color,display_order,is_active",  # ADDED is_active
+            "select": "id,section_title,section_type,accent_color,display_order,is_active",
             "order": "display_order",
             "is_active": "eq.true"  # This filters only active sections
         }
@@ -730,11 +739,14 @@ async def get_hierarchy():
         
         result = []
         for section in sections:
+            section_id = section['id']
+            section_type = section['section_type']
+            
             # Get headers for this section
             headers_params = {
                 "select": "header_text,display_order",
                 "order": "display_order",
-                "section_id": f"eq.{section['id']}"
+                "section_id": f"eq.{section_id}"
             }
             headers = supabase_request("GET", "hierarchy_headers", params=headers_params)
             
@@ -742,9 +754,18 @@ async def get_hierarchy():
             entries_params = {
                 "select": "rank,username,army_rank,roblox_id,requirements,display_order",
                 "order": "display_order",
-                "section_id": f"eq.{section['id']}"
+                "section_id": f"eq.{section_id}"
             }
             entries = supabase_request("GET", "hierarchy_entries", params=entries_params)
+            
+            # For document sections, ensure proper headers
+            if section_type == 'documents' and not headers:
+                # Add default headers for document sections
+                headers = [
+                    {"header_text": "Document Name", "display_order": 1},
+                    {"header_text": "Description", "display_order": 2},
+                    {"header_text": "Link", "display_order": 3}
+                ]
             
             result.append({
                 "section": section,
@@ -768,11 +789,13 @@ async def get_hierarchy_admin(user: dict = Depends(is_admin_or_hicom)):
         
         result = []
         for section in sections:
+            section_id = section['id']
+            
             # Get headers
             headers_params = {
                 "select": "id,header_text,display_order",
                 "order": "display_order",
-                "section_id": f"eq.{section['id']}"
+                "section_id": f"eq.{section_id}"
             }
             headers = supabase_request("GET", "hierarchy_headers", params=headers_params)
             
@@ -780,7 +803,7 @@ async def get_hierarchy_admin(user: dict = Depends(is_admin_or_hicom)):
             entries_params = {
                 "select": "id,rank,username,army_rank,roblox_id,requirements,display_order",
                 "order": "display_order", 
-                "section_id": f"eq.{section['id']}"
+                "section_id": f"eq.{section_id}"
             }
             entries = supabase_request("GET", "hierarchy_entries", params=entries_params)
             
@@ -801,8 +824,12 @@ async def get_hierarchy_admin(user: dict = Depends(is_admin_or_hicom)):
 async def create_hierarchy_section(data: dict, user: dict = Depends(is_admin_or_hicom)):
     """Create a new hierarchy section"""
     payload = _filter_payload(data, HIERARCHY_SECTION_COLUMNS)
+    
     if not payload.get("section_title") or not payload.get("section_type"):
         raise HTTPException(status_code=400, detail="Missing required fields")
+    
+    # Validate section type
+    validate_section_type(payload.get("section_type"))
     
     return supabase_request("POST", "hierarchy_sections", data=payload)
 
@@ -813,6 +840,10 @@ async def update_hierarchy_section(section_id: str, data: dict, user: dict = Dep
     payload = _filter_payload(data, HIERARCHY_SECTION_COLUMNS)
     if not payload:
         raise HTTPException(status_code=400, detail="No valid fields to update")
+    
+    # Validate section type if provided
+    if 'section_type' in payload:
+        validate_section_type(payload.get("section_type"))
     
     return supabase_request("PATCH", "hierarchy_sections", data=payload, record_id=section_id)
 
